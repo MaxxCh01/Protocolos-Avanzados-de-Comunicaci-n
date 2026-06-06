@@ -1,0 +1,78 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define I2C_SLAVE_ADDR 0x20
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
+
+// NUEVOS PINES SEGUROS PARA LA PANTALLA OLED
+#define OLED_SDA 13 
+#define OLED_SCL 14 
+
+// Pasamos &Wire1 directamente a la librería
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire1, OLED_RESET);
+
+volatile char rxBuffer[32];
+volatile bool newData = false;
+volatile size_t rxLength = 0;
+
+void receiveEvent(int howMany) {
+  rxLength = 0;
+  while (Wire.available() && rxLength < sizeof(rxBuffer) - 1) {
+    rxBuffer[rxLength++] = (char)Wire.read();
+  }
+  rxBuffer[rxLength] = '\0';
+  newData = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500); // Pausa para estabilizar energía
+  Serial.println("\n--- ESP32 Iniciando ---");
+
+  // 1. Bus Esclavo (Conectado al MSP430) -> Pines nativos 21 y 22
+  Wire.begin(I2C_SLAVE_ADDR);
+  Wire.onReceive(receiveEvent);
+  Serial.println("I2C Esclavo configurado (Pins 21/22)");
+
+  // 2. Bus Maestro de la OLED -> Usando el periférico Wire1 nativo en pines 13 y 14
+  Wire1.begin(OLED_SDA, OLED_SCL, 400000);
+  Serial.println("I2C Maestro OLED configurado (Pins 13/14)");
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("ERROR: No se pudo encontrar la pantalla OLED");
+    while (1); // Si falla, se queda aquí y lo verás en el monitor serie
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ESP32 I2C OK");
+  display.println("Esperando datos...");
+  display.display();
+  Serial.println("OLED Inicializada correctamente.");
+}
+
+void loop() {
+  if (newData) {
+    char localBuffer[32];
+
+    noInterrupts();
+    strcpy(localBuffer, (char*)rxBuffer);
+    newData = false;
+    interrupts();
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Recibido:");
+    display.println(localBuffer);
+    display.display();
+
+    Serial.print("Mensaje del Maestro: ");
+    Serial.println(localBuffer);
+  }
+  delay(10);
+}

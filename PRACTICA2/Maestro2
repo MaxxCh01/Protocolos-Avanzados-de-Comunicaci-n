@@ -1,0 +1,140 @@
+#include <msp430.h>
+
+#define SLAVE_MSP   0x10
+#define SLAVE_ESP   0x20
+#define OLED_ADDR   0x3C
+#define I2C_TIMEOUT_CYCLES  10000UL // Reducido para una respuesta más rápida ante fallas
+
+void init_I2C_Master(void);
+unsigned char I2C_Write_Timeout(unsigned char slave_addr, unsigned char *data, unsigned char length, unsigned long timeout);
+void OLED_Init_And_Clear(void);
+
+void init_I2C_Master(void) {
+    P3SEL |= BIT0 | BIT1;       // P3.0 = SDA, P3.1 = SCL
+    UCB0CTL1 |= UCSWRST;        // Activar reset de software
+    UCB0CTL0 = UCMST + UCMODE_3 + UCSYNC; // Maestro, I2C, Sincrónico
+    UCB0CTL1 = UCSSEL_2 + UCSWRST;        // Usar SMCLK
+    UCB0BR0 = 10;               // Divisor para ~100kHz si SMCLK es ~1MHz
+    UCB0BR1 = 0;
+    UCB0CTL1 &= ~UCSWRST;       // Liberar reset de software
+}
+
+unsigned char I2C_Write_Timeout(unsigned char slave_addr, unsigned char *data, unsigned char length, unsigned long timeout) {
+    unsigned char i;
+    unsigned long wait;
+
+    // Si el bus se quedó colgado de un intento previo, reseteamos el periférico por seguridad
+    if (UCB0STAT & UCBBUSY) {
+        UCB0CTL1 |= UCSWRST;
+        UCB0CTL1 &= ~UCSWRST;
+    }
+
+    UCB0I2CSA = slave_addr;
+    UCB0CTL1 |= UCTR + UCTXSTT; // Modo Transmisor + START
+
+    // Esperar por la bandera de transmisión (UCTXIFG)
+    wait = timeout;
+    while (!(UCB0IFG & UCTXIFG)) {
+        if (UCB0STAT & UCNACKIFG) {
+            UCB0CTL1 |= UCTXSTP;
+            UCB0STAT &= ~UCNACKIFG;
+            return 0;
+        }
+        if (--wait == 0) {
+            UCB0CTL1 |= UCSWRST; // CORREGIDO: Reset de emergencia si el bus físico no responde
+            UCB0CTL1 &= ~UCSWRST;
+            return 0;
+        }
+    }
+
+    // Enviar la ráfaga de datos
+    for (i = 0; i < length; i++) {
+        UCB0TXBUF = data[i];
+        wait = timeout;
+        while (!(UCB0IFG & UCTXIFG)) {
+            if (UCB0STAT & UCNACKIFG) {
+                UCB0CTL1 |= UCTXSTP;
+                UCB0STAT &= ~UCNACKIFG;
+                return 0;
+            }
+            if (--wait == 0) {
+                UCB0CTL1 |= UCSWRST; // CORREGIDO: Reset de emergencia
+                UCB0CTL1 &= ~UCSWRST;
+                return 0;
+            }
+        }
+    }
+
+    // Generar condición de STOP
+    UCB0CTL1 |= UCTXSTP;
+    wait = timeout;
+    while (UCB0CTL1 & UCTXSTP) {
+        if (--wait == 0) {
+            UCB0CTL1 |= UCSWRST; // CORREGIDO: Si el STOP se queda pegado por falta de pull-ups
+            UCB0CTL1 &= ~UCSWRST;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void OLED_Init_And_Clear(void) {
+    unsigned char init_cmds[] = {
+        0x00, 0xAE, 0x00, 0xD5, 0x80, 0x00, 0xA8, 0x3F,
+        0x00, 0xD3, 0x00, 0x00, 0x40, 0x00, 0x8D, 0x14,
+        0x00, 0xAF
+    };
+    unsigned char set_column[] = { 0x00, 0x21, 0x00, 0x7F };
+    unsigned char set_page[]   = { 0x00, 0x22, 0x00, 0x07 };
+    unsigned long wait;
+    int i;
+
+    // Enviar comandos de inicialización básicos
+    I2C_Write_Timeout(OLED_ADDR, init_cmds, sizeof(init_cmds), I2C_TIMEOUT_CYCLES);
+    I2C_Write_Timeout(OLED_ADDR, set_column, sizeof(set_column), I2C_TIMEOUT_CYCLES);
+    I2C_Write_Timeout(OLED_ADDR, set_page, sizeof(set_page), I2C_TIMEOUT_CYCLES);
+
+    // OPTIMIZACIÓN CRÍTICA: Escribir los 1024 bytes en una sola ráfaga continua (Stream)
+    UCB0I2CSA = OLED_ADDR;
+    UCB0CTL1 |= UCTR + UCTXSTT;
+
+    wait = I2C_TIMEOUT_CYCLES;
+    while (!(UCB0IFG & UCTXIFG)) { if (--wait == 0) { UCB0CTL1 |= UCSWRST; UCB0CTL1 &= ~UCSWRST; return; } }
+
+    UCB0TXBUF = 0x40; // Modo Datos secuenciales
+
+    for (i = 0; i < 1024; i++) {
+        wait = I2C_TIMEOUT_CYCLES;
+        while (!(UCB0IFG & UCTXIFG)) { if (--wait == 0) { UCB0CTL1 |= UCSWRST; UCB0CTL1 &= ~UCSWRST; return; } }
+        UCB0TXBUF = 0x00; // Vaciar pixel
+    }
+
+    UCB0CTL1 |= UCTXSTP;
+    wait = I2C_TIMEOUT_CYCLES;
+    while (UCB0CTL1 & UCTXSTP) { if (--wait == 0) { UCB0CTL1 |= UCSWRST; UCB0CTL1 &= ~UCSWRST; return; } }
+}
+
+int main(void) {
+    unsigned char msgMSP[] = "Hola MSP";
+    unsigned char msgESP[] = "Hola ESP";
+
+    WDTCTL = WDTPW | WDTHOLD;   // Detener Watchdog
+
+    // Configurar LED Rojo para diagnóstico
+    P1DIR |= BIT0;
+    P1OUT &= ~BIT0;
+
+    init_I2C_Master();
+    __delay_cycles(50000);      // Esperar a que todo el hardware se energice bien
+
+    OLED_Init_And_Clear();      // Si el bus falla, saldrá rápido gracias al reset por software
+
+    while (1) {
+        P1OUT ^= BIT0;          // CADA PARPADEO INDICA UN INTENTO DE ENVÍO COMPLETO
+
+        // Transmisión al ESP32 (Temporalmente dejamos solo esta para tus pruebas)
+        I2C_Write_Timeout(SLAVE_ESP, msgESP, sizeof(msgESP)-1, I2C_TIMEOUT_CYCLES);
+
+        __delay_cycles(400000); // Pausa visible para notar el parpadeo del LED
+    }
+}

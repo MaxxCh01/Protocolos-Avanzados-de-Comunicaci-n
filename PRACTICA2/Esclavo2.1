@@ -1,0 +1,48 @@
+#include <msp430.h>
+#include <stdint.h>
+
+#define MI_DIRECCION 0x10
+
+volatile char buffer[20];
+volatile uint8_t indice = 0;
+
+void init_I2C_Slave(void)
+{
+    P3SEL |= BIT0 | BIT1;
+
+    UCB0CTL1 |= UCSWRST;
+
+    UCB0CTL0 = UCMODE_3 | UCSYNC;
+
+    UCB0I2COA = (MI_DIRECCION << 1);
+
+    UCB0CTL1 &= ~UCSWRST;
+
+    UCB0IE |= UCRXIE;
+}
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    init_I2C_Slave();
+
+    __bis_SR_register(GIE);
+
+    while(1);
+}
+
+#pragma vector=USCI_B0_VECTOR
+__interrupt void USCI_B0_ISR(void)
+{
+    if(UCB0IFG & UCRXIFG)
+    {
+        char dato = UCB0RXBUF;
+
+        if(indice < sizeof(buffer)-1)
+        {
+            buffer[indice++] = dato;
+            buffer[indice] = '\0';
+        }
+    }
+}
