@@ -1,0 +1,4 @@
+skyfield
+requests
+gpiozero
+RPi.GPIO

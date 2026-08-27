@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=HMI NOAA
+Comment=Arranca el HMI de seguimiento de satélites NOAA al iniciar sesión
+Exec=/usr/bin/python3 /home/pi/hmi_project/hmi_main.py
+X-GNOME-Autostart-enabled=true
