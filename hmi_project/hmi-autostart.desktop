@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=HMI METEOR-M
+Comment=Arranca el HMI de seguimiento de satélites METEOR-M al iniciar sesión
+Exec=/usr/bin/python3 /home/pi/hmi_project/hmi_main.py
+X-GNOME-Autostart-enabled=true
