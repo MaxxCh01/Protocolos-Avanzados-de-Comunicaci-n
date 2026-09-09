@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Trayectoria 3D - METEOR-M</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; height:100%; }
+  #contenedor3d { width:100vw; height:100vh; touch-action:none; }
+  #panel {
+    position:absolute; top:12px; left:12px; z-index:10;
+    background:rgba(10,20,35,0.75); color:#eee; font-family:sans-serif;
+    padding:10px 14px; border-radius:8px; font-size:14px; line-height:1.5;
+  }
+  #panel b { color:#5DCAA5; }
+  #ayuda {
+    position:absolute; bottom:10px; left:12px; z-index:10;
+    color:#aaa; font-family:sans-serif; font-size:12px;
+  }
+  #btnSalir {
+    position:absolute; top:12px; right:12px; z-index:10;
+    background:#993C1D; color:white; border:none; border-radius:8px;
+    padding:10px 18px; font-size:14px; font-family:sans-serif; cursor:pointer;
+  }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <div><b>METEOR-M</b></div>
+  <div>Lat: <span id="outLat">0.0</span>&deg;  Lon: <span id="outLon">0.0</span>&deg;</div>
+  <div>Visible desde antena: <span id="outVisible">No</span></div>
+  <div style="margin-top:6px;">
+    Velocidad: <input type="range" id="velocidad" min="0.25" max="8" step="0.25" value="1" style="vertical-align:middle;">
+    <span id="velocidadOut">1.0x</span>
+  </div>
+</div>
+<div id="ayuda">Arrastra para rotar &middot; rueda/pellizco para zoom</div>
+<button id="btnSalir">Salir (Esc)</button>
+<div id="contenedor3d"></div>
+
+<script src="assets/vendor/three.min.js"></script>
+<script>
+(function(){
+  const cont = document.getElementById('contenedor3d');
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.set(0, 0, 6.2);
+
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  cont.appendChild(renderer.domElement);
+
+  window.addEventListener('resize', function(){
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const luz = new THREE.DirectionalLight(0xffffff, 1.1);
+  luz.position.set(5, 3, 5);
+  scene.add(luz);
+
+  const estrellas = new THREE.Group();
+  const geomEstrella = new THREE.SphereGeometry(0.02, 4, 4);
+  const matEstrella = new THREE.MeshBasicMaterial({color: 0xffffff});
+  for(let i=0;i<300;i++){
+    const e = new THREE.Mesh(geomEstrella, matEstrella);
+    const r = 15;
+    const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+    e.position.set(r*Math.sin(phi)*Math.cos(theta), r*Math.sin(phi)*Math.sin(theta), r*Math.cos(phi));
+    estrellas.add(e);
+  }
+  scene.add(estrellas);
+
+  const R_TIERRA = 2.0;
+  const ALTITUD_REL = 0.32;
+
+  const grupo = new THREE.Group();
+  scene.add(grupo);
+
+  const tierra = new THREE.Mesh(
+    new THREE.SphereGeometry(R_TIERRA, 64, 48),
+    new THREE.MeshPhongMaterial({color: 0x223355, shininess: 8})
+  );
+  grupo.add(tierra);
+
+  // Textura real de la Tierra (archivo LOCAL, no requiere internet)
+  new THREE.TextureLoader().load('assets/tierra.jpg', function(textura){
+    tierra.material = new THREE.MeshPhongMaterial({map: textura, shininess: 8});
+  });
+
+  const INCL_DEG = 98.6;
+  const PERIODO_MIN = 101.3;
+  const incl = INCL_DEG * Math.PI / 180;
+
+  function latLonAPosicion(lat, lon, radio){
+    const la = lat * Math.PI / 180;
+    const lo = lon * Math.PI / 180;
+    const x = radio * Math.cos(la) * Math.cos(lo);
+    const y = radio * Math.sin(la);
+    const z = radio * Math.cos(la) * Math.sin(lo);
+    return new THREE.Vector3(x, y, z);
+  }
+
+  function calcularPosicion(tMin){
+    const fase = (tMin / PERIODO_MIN) * 2 * Math.PI;
+    const lat = Math.asin(Math.sin(incl) * Math.sin(fase)) * 180 / Math.PI;
+    let lonOrbita = Math.atan2(Math.cos(incl) * Math.sin(fase), Math.cos(fase)) * 180 / Math.PI;
+    const rotacionTierra = 360 * (tMin / 1440);
+    let lon = lonOrbita - rotacionTierra;
+    lon = ((lon + 180) % 360 + 360) % 360 - 180;
+    return [lat, lon];
+  }
+
+  const puntosOrbita = [];
+  for(let t=0; t<=PERIODO_MIN; t+=1){
+    const fase = (t / PERIODO_MIN) * 2 * Math.PI;
+    const lat = Math.asin(Math.sin(incl) * Math.sin(fase)) * 180 / Math.PI;
+    const lonOrbita = Math.atan2(Math.cos(incl) * Math.sin(fase), Math.cos(fase)) * 180 / Math.PI;
+    puntosOrbita.push(latLonAPosicion(lat, lonOrbita, R_TIERRA + ALTITUD_REL));
+  }
+  puntosOrbita.push(puntosOrbita[0]);
+  const lineaOrbita = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(puntosOrbita),
+    new THREE.LineBasicMaterial({color: 0x5DCAA5})
+  );
+  grupo.add(lineaOrbita);
+
+  const satelite = new THREE.Mesh(
+    new THREE.SphereGeometry(0.06, 16, 16),
+    new THREE.MeshBasicMaterial({color: 0xE24B4A})
+  );
+  grupo.add(satelite);
+
+  // Coordenadas de la estacion terrena (usa las mismas de tu config.py)
+  const GS_LAT = 22.77, GS_LON = -102.58;
+  const posEstacion = latLonAPosicion(GS_LAT, GS_LON, R_TIERRA + 0.02);
+  const estacion = new THREE.Mesh(
+    new THREE.ConeGeometry(0.05, 0.12, 8),
+    new THREE.MeshBasicMaterial({color: 0xEF9F27})
+  );
+  estacion.position.copy(posEstacion);
+  estacion.lookAt(posEstacion.clone().multiplyScalar(2));
+  estacion.rotateX(Math.PI/2);
+  grupo.add(estacion);
+
+  function distanciaAngular(lat1, lon1, lat2, lon2){
+    const r = Math.PI / 180;
+    const d = Math.sin(lat1*r)*Math.sin(lat2*r) + Math.cos(lat1*r)*Math.cos(lat2*r)*Math.cos((lon1-lon2)*r);
+    return Math.acos(Math.max(-1, Math.min(1, d))) * 180 / Math.PI;
+  }
+
+  let rotY = 0.6, rotX = -0.3;
+
+  let arrastrando = false;
+  let ultimoX = 0, ultimoY = 0;
+  let distanciaPinchAnterior = null;
+
+  function inicioArrastre(x, y){ arrastrando = true; ultimoX = x; ultimoY = y; }
+  function moverArrastre(x, y){
+    if(!arrastrando) return;
+    const dx = x - ultimoX, dy = y - ultimoY;
+    rotY += dx * 0.005;
+    rotX += dy * 0.005;
+    rotX = Math.max(-1.3, Math.min(1.3, rotX));
+    ultimoX = x; ultimoY = y;
+  }
+  function finArrastre(){ arrastrando = false; distanciaPinchAnterior = null; }
+
+  const dom = renderer.domElement;
+  dom.addEventListener('mousedown', function(e){ inicioArrastre(e.clientX, e.clientY); });
+  window.addEventListener('mousemove', function(e){ moverArrastre(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', finArrastre);
+
+  dom.addEventListener('touchstart', function(e){
+    if(e.touches.length === 1){
+      inicioArrastre(e.touches[0].clientX, e.touches[0].clientY);
+    } else if(e.touches.length === 2){
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      distanciaPinchAnterior = Math.sqrt(dx*dx + dy*dy);
+    }
+    e.preventDefault();
+  }, {passive:false});
+
+  dom.addEventListener('touchmove', function(e){
+    if(e.touches.length === 1){
+      moverArrastre(e.touches[0].clientX, e.touches[0].clientY);
+    } else if(e.touches.length === 2){
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if(distanciaPinchAnterior !== null){
+        const delta = dist - distanciaPinchAnterior;
+        camera.position.z = Math.max(3.2, Math.min(12, camera.position.z - delta * 0.02));
+      }
+      distanciaPinchAnterior = dist;
+    }
+    e.preventDefault();
+  }, {passive:false});
+
+  dom.addEventListener('touchend', finArrastre);
+
+  dom.addEventListener('wheel', function(e){
+    camera.position.z = Math.max(3.2, Math.min(12, camera.position.z + e.deltaY * 0.005));
+    e.preventDefault();
+  }, {passive:false});
+
+  document.getElementById('btnSalir').addEventListener('click', function(){ window.close(); });
+  window.addEventListener('keydown', function(e){
+    if(e.key === 'Escape'){ window.close(); }
+  });
+
+  let tMin = 0;
+  let velocidadMinPorSeg = 1; // minutos orbitales simulados por cada segundo REAL
+  let ultimoTs = null;
+  const outLat = document.getElementById('outLat');
+  const outLon = document.getElementById('outLon');
+  const outVisible = document.getElementById('outVisible');
+  const sliderVel = document.getElementById('velocidad');
+  const velocidadOut = document.getElementById('velocidadOut');
+
+  sliderVel.addEventListener('input', function(){
+    velocidadMinPorSeg = parseFloat(sliderVel.value);
+    velocidadOut.textContent = velocidadMinPorSeg.toFixed(2) + 'x';
+  });
+
+  function animar(ts){
+    // Avanza según el tiempo REAL transcurrido entre cuadros (no un 1/60
+    // fijo), así la velocidad no depende de la tasa de refresco de la
+    // pantalla/Chromium en la Raspberry Pi.
+    if(ultimoTs === null) ultimoTs = ts;
+    const dtSeg = (ts - ultimoTs) / 1000;
+    ultimoTs = ts;
+
+    tMin += dtSeg * velocidadMinPorSeg;
+    if(tMin > PERIODO_MIN) tMin -= PERIODO_MIN;
+
+    const [lat, lon] = calcularPosicion(tMin);
+    const fase = (tMin / PERIODO_MIN) * 2 * Math.PI;
+    const latOrb = Math.asin(Math.sin(incl) * Math.sin(fase)) * 180 / Math.PI;
+    const lonOrb = Math.atan2(Math.cos(incl) * Math.sin(fase), Math.cos(fase)) * 180 / Math.PI;
+    satelite.position.copy(latLonAPosicion(latOrb, lonOrb, R_TIERRA + ALTITUD_REL));
+
+    outLat.textContent = lat.toFixed(1);
+    outLon.textContent = lon.toFixed(1);
+    const dist = distanciaAngular(lat, lon, GS_LAT, GS_LON);
+    const visible = dist < 22;
+    outVisible.textContent = visible ? 'Si' : 'No';
+    outVisible.style.color = visible ? '#5DCAA5' : '#eee';
+
+    grupo.rotation.y = rotY;
+    grupo.rotation.x = rotX;
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(animar);
+  }
+  requestAnimationFrame(animar);
+})();
+</script>
+</body>
+</html>

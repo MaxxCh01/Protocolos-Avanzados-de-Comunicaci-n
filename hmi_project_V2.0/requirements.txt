@@ -1,0 +1,7 @@
+skyfield
+requests
+gpiozero
+numpy
+matplotlib
+pyrtlsdr
+pyserial
