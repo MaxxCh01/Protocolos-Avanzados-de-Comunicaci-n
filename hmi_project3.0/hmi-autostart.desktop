@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=HMI METEOR-M
+Comment=Arranca el HMI de seguimiento de satélites METEOR-M al iniciar sesión
+# IMPORTANTE: reemplaza "TU_USUARIO" por tu usuario real de Raspberry Pi
+# (por ejemplo "pi" o "maxchqto"), según dónde hayas copiado el proyecto.
+Exec=/usr/bin/python3 /home/TU_USUARIO/hmi_project/hmi_main.py
+X-GNOME-Autostart-enabled=true
