@@ -28,12 +28,21 @@ hmi_project/
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-tk python3-rpi.gpio
+sudo apt install -y python3-pip python3-tk python3-rpi.gpio python3-pil.imagetk
 
-# Copia la carpeta hmi_project a /home/pi/
-cd /home/pi/hmi_project
+# Copia la carpeta hmi_project a tu carpeta personal (usa tu propio usuario,
+# no necesariamente "pi" — por ejemplo /home/maxchqto/hmi_project)
+cd ~/hmi_project
 pip3 install -r requirements.txt --break-system-packages
 ```
+
+`python3-pil.imagetk` es necesario para que matplotlib pueda dibujar
+dentro de las ventanas de Tkinter (espectro y trayectoria); en Debian/
+Raspberry Pi OS este submódulo de Pillow viene separado del paquete base.
+
+La ruta donde se guarda la caché de TLE (`RUTA_CACHE_TLE` en `config.py`)
+se calcula automáticamente a partir de `$HOME`, así que funciona sin
+importar el nombre de tu usuario.
 
 Antes de correrlo, edita `config.py`:
 - `LAT_OBSERVADOR`, `LON_OBSERVADOR`, `ELEV_OBSERVADOR_M`: coordenadas reales de tu antena.
@@ -80,7 +89,8 @@ entre la fuente externa y el Raspberry.
 
 `tle_manager.py` intenta descargar los TLE de CelesTrak cada vez que
 arranca el HMI. Si no hay internet:
-1. Busca el último archivo guardado en `/home/pi/hmi_data/tle_cache.txt`.
+1. Busca el último archivo guardado en `~/hmi_data/tle_cache.txt` (dentro
+   de tu carpeta personal, según `RUTA_CACHE_TLE` en `config.py`).
 2. Si existe, lo usa para calcular las órbitas con SGP4 (a través de
    Skyfield) aunque los datos ya no sean del día.
 3. Si nunca se ha descargado nada (primer uso sin red), el HMI avisa en
@@ -120,15 +130,18 @@ y el servo.
 ### Opción A (recomendada) — Autologin + autostart de escritorio
 Usa esta opción si trabajas con Raspberry Pi OS con escritorio (LXDE/Wayfire).
 
-1. Activa el autologin del usuario `pi`:
+1. Activa el autologin de tu usuario (sustituye `pi` por tu usuario real,
+   por ejemplo `maxchqto`, si es distinto):
    ```bash
    sudo raspi-config
    # System Options -> Boot / Auto Login -> Desktop Autologin
    ```
-2. Copia el archivo de autoarranque:
+2. Copia el archivo de autoarranque y edítalo con tu ruta real de usuario
+   (reemplaza `TU_USUARIO` dentro del archivo por tu nombre de usuario):
    ```bash
    mkdir -p ~/.config/autostart
-   cp /home/pi/hmi_project/hmi-autostart.desktop ~/.config/autostart/
+   cp ~/hmi_project/hmi-autostart.desktop ~/.config/autostart/
+   nano ~/.config/autostart/hmi-autostart.desktop   # reemplaza TU_USUARIO
    ```
 3. Desactiva el protector de pantalla y el apagado de pantalla (para que el
    HMI no se ponga en negro):
@@ -151,10 +164,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=pi
+User=TU_USUARIO
 Environment=DISPLAY=:0
 ExecStartPre=/bin/sleep 5
-ExecStart=/usr/bin/startx /usr/bin/python3 /home/pi/hmi_project/hmi_main.py -- -nocursor
+ExecStart=/usr/bin/startx /usr/bin/python3 /home/TU_USUARIO/hmi_project/hmi_main.py -- -nocursor
 Restart=on-failure
 
 [Install]

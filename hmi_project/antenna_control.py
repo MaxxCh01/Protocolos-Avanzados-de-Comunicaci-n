@@ -1,72 +1,28 @@
 """
 Control de la antena.
 
-- Calcula azimut/elevación del satélite respecto al observador usando
-  Skyfield (que internamente usa SGP4 sobre los datos TLE).
-- Mueve un motor de pasos 28BYJ-48 (vía ULN2003) para el AZIMUT.
-- Mueve un servomotor para la ELEVACIÓN.
-
-Si el código se ejecuta en una PC sin GPIO (por ejemplo para probarlo antes
-de subirlo al Raspberry Pi), entra en "modo simulación" automáticamente:
-no mueve hardware real pero sí calcula e imprime los ángulos.
+- Calcula azimut/elevación/velocidad radial/pase del satélite respecto al
+  observador usando Skyfield (SGP4 sobre los TLE). Esto lo sigue haciendo
+  la Raspberry Pi, que tiene más capacidad de cómputo.
+- El movimiento físico (motor de pasos de azimut + servo de elevación) y
+  la lectura del módulo GPS ya NO se hacen con RPi.GPIO: se delegan a un
+  Raspberry Pi Pico 2 dedicado, controlado por serial/UART a través de
+  pico_link.EnlacePico. Esto evita por completo los problemas de RPi.GPIO
+  en Raspberry Pi 5 (chip RP1), porque la Pi ya no toca GPIO para esto.
 """
-import time
 import numpy as np
 from skyfield.api import wgs84
-import config
 
-try:
-    import RPi.GPIO as GPIO
-    RASPBERRY = True
-except (ImportError, RuntimeError):
-    RASPBERRY = False
-
-try:
-    from gpiozero import Servo
-except ImportError:
-    Servo = None
-
-
-# Secuencia de medio paso para el 28BYJ-48 (más torque y suavidad que paso completo)
-SECUENCIA_MEDIO_PASO = [
-    [1, 0, 0, 0],
-    [1, 1, 0, 0],
-    [0, 1, 0, 0],
-    [0, 1, 1, 0],
-    [0, 0, 1, 0],
-    [0, 0, 1, 1],
-    [0, 0, 0, 1],
-    [1, 0, 0, 1],
-]
+from pico_link import EnlacePico
 
 
 class ControlAntena:
-    def __init__(self, observador):
-        """observador: objeto skyfield.wgs84.latlon(...) con la posición de la antena."""
+    def __init__(self, observador, enlace_pico=None):
+        """observador: objeto skyfield.wgs84.latlon(...) con la posición de la antena.
+        enlace_pico: instancia de EnlacePico ya creada (opcional; si no se
+        pasa, se crea una nueva usando la configuración de config.py)."""
         self.observador = observador
-        self.paso_actual = 0
-        self.angulo_azimut_actual = 0.0
-        self.servo = None
-
-        self._init_stepper()
-        self._init_servo()
-
-        if not RASPBERRY:
-            print("[Antena] Modo simulación: no se detectó hardware Raspberry Pi (RPi.GPIO).")
-
-    # ---------- Inicialización de hardware ----------
-    def _init_stepper(self):
-        if not RASPBERRY:
-            return
-        GPIO.setmode(GPIO.BCM)
-        for pin in config.PINES_STEPPER:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, 0)
-
-    def _init_servo(self):
-        if Servo is None or not RASPBERRY:
-            return
-        self.servo = Servo(config.PIN_SERVO_ELEVACION)
+        self.enlace_pico = enlace_pico or EnlacePico()
 
     # ---------- Cálculo orbital (SGP4 vía Skyfield) ----------
     def calcular_az_el(self, satelite, tiempo):
@@ -145,57 +101,48 @@ class ControlAntena:
             "en_curso": aos.tt <= tiempo_referencia.tt <= los.tt,
         }
 
-    # ---------- Motor de pasos: AZIMUT ----------
-    def _mover_stepper_a_grados(self, grados_destino):
-        grados_destino = grados_destino % 360
-        pasos_destino = int((grados_destino / 360.0) * config.PASOS_POR_VUELTA)
-        pasos_actuales = int((self.angulo_azimut_actual / 360.0) * config.PASOS_POR_VUELTA)
+    def calcular_trayectoria_completa(self, satelite, ts, tiempo_referencia, n_puntos=120):
+        """Traza en tierra (lat/lon) de UNA ÓRBITA COMPLETA del satélite,
+        centrada en `tiempo_referencia` (mitad antes, mitad después). Esto es
+        independiente de si hay o no un pase visible desde el observador:
+        sirve para mostrar la trayectoria completa alrededor de la Tierra,
+        con el satélite avanzando sobre ella en tiempo real.
 
-        diferencia_pasos = pasos_destino - pasos_actuales
-        mitad_vuelta = config.PASOS_POR_VUELTA // 2
-        # Tomar siempre el camino más corto (evita que la antena dé la vuelta completa)
-        if diferencia_pasos > mitad_vuelta:
-            diferencia_pasos -= config.PASOS_POR_VUELTA
-        elif diferencia_pasos < -mitad_vuelta:
-            diferencia_pasos += config.PASOS_POR_VUELTA
+        El periodo orbital se obtiene del propio modelo SGP4 del satélite
+        (mean motion), así que sirve para cualquier órbita, no solo LEO."""
+        movimiento_medio_rad_min = satelite.model.no_kozai  # rad/minuto
+        periodo_min = 2 * np.pi / movimiento_medio_rad_min
 
-        direccion = 1 if diferencia_pasos >= 0 else -1
+        fracciones = np.linspace(-0.5, 0.5, n_puntos)
+        jds = tiempo_referencia.tt + (periodo_min * fracciones) / (24 * 60)
+        tiempos_muestra = ts.tt_jd(jds)
 
-        if not RASPBERRY:
-            print(f"[Antena-SIM] Azimut: {self.angulo_azimut_actual:.1f}° -> {grados_destino:.1f}°")
-            self.angulo_azimut_actual = grados_destino
-            return
+        subpuntos = wgs84.subpoint(satelite.at(tiempos_muestra))
 
-        for _ in range(abs(diferencia_pasos)):
-            self.paso_actual = (self.paso_actual + direccion) % 8
-            for pin, valor in zip(config.PINES_STEPPER, SECUENCIA_MEDIO_PASO[self.paso_actual]):
-                GPIO.output(pin, valor)
-            time.sleep(0.0015)  # velocidad del motor; ajusta según tu 28BYJ-48
+        return {
+            "latitudes": subpuntos.latitude.degrees,
+            "longitudes": subpuntos.longitude.degrees,
+            "periodo_min": periodo_min,
+        }
 
-        self.angulo_azimut_actual = grados_destino
-
-    # ---------- Servo: ELEVACIÓN ----------
-    def _mover_servo_a_grados(self, grados_destino):
-        grados_destino = max(config.SERVO_ANGULO_MIN, min(config.SERVO_ANGULO_MAX, grados_destino))
-
-        if not RASPBERRY or self.servo is None:
-            print(f"[Antena-SIM] Elevación -> {grados_destino:.1f}°")
-            return
-
-        # gpiozero.Servo usa un rango de -1..1 equivalente a 0°..180°
-        valor = (grados_destino / 90.0) * 2 - 1
-        self.servo.value = max(-1, min(1, valor))
+    # ---------- Posición del observador desde el GPS del Pico ----------
+    def actualizar_desde_gps(self):
+        """Si el Pico 2 ya tiene un fix de GPS válido, actualiza la posición
+        del observador con esas coordenadas (útil si la antena es portátil).
+        Devuelve True si se actualizó, False si aún no hay fix."""
+        gps = self.enlace_pico.obtener_ultimo_gps()
+        if gps["fix"] and gps["lat"] is not None and gps["lon"] is not None:
+            self.observador = wgs84.latlon(gps["lat"], gps["lon"], gps["alt"] or 0.0)
+            return True
+        return False
 
     # ---------- API pública ----------
     def apuntar_a(self, az_grados, el_grados):
-        """Mueve azimut y elevación a los ángulos indicados. Es una llamada BLOQUEANTE:
-        en el HMI se ejecuta dentro de un hilo aparte para no congelar la interfaz."""
-        self._mover_stepper_a_grados(az_grados)
-        self._mover_servo_a_grados(el_grados)
+        """Envía los ángulos deseados al Pico 2 por serial para que mueva
+        el motor (azimut) y el servo (elevación). Ya no es una llamada
+        bloqueante como antes: el Pico se mueve por su cuenta."""
+        self.enlace_pico.enviar_angulos(az_grados, el_grados)
 
     def liberar(self):
-        """Apaga las bobinas del motor y libera los pines GPIO. Llamar al cerrar el programa."""
-        if RASPBERRY:
-            for pin in config.PINES_STEPPER:
-                GPIO.output(pin, 0)
-            GPIO.cleanup()
+        """Cierra el puerto serial con el Pico. Llamar al cerrar el programa."""
+        self.enlace_pico.cerrar()

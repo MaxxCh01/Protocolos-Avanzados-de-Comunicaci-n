@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Trayectoria 3D - METEOR-M</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; height:100%; }
+  #contenedor3d { width:100vw; height:100vh; touch-action:none; }
+  #panel {
+    position:absolute; top:12px; left:12px; z-index:10;
+    background:rgba(10,20,35,0.75); color:#eee; font-family:sans-serif;
+    padding:10px 14px; border-radius:8px; font-size:14px; line-height:1.5;
+  }
+  #panel b { color:#5DCAA5; }
+  #ayuda {
+    position:absolute; bottom:10px; left:12px; z-index:10;
+    color:#aaa; font-family:sans-serif; font-size:12px;
+  }
+  #btnSalir {
+    position:absolute; top:12px; right:12px; z-index:10;
+    background:#993C1D; color:white; border:none; border-radius:8px;
+    padding:10px 18px; font-size:14px; font-family:sans-serif; cursor:pointer;
+  }
+  #estadoFetch {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    z-index:10; color:#ffcc00; font-family:sans-serif; font-size:12px;
+    background:rgba(0,0,0,0.5); padding:4px 10px; border-radius:6px;
+    display:none;
+  }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <div><b><span id="outNombre">METEOR-M</span></b></div>
+  <div>Lat: <span id="outLat">--</span>&deg;  Lon: <span id="outLon">--</span>&deg;</div>
+  <div>Alt: <span id="outAlt">--</span> km</div>
+  <div>Visible desde antena: <span id="outVisible">--</span></div>
+  <div style="font-size:11px; color:#aaa; margin-top:4px;">Tiempo real (SGP4)</div>
+</div>
+<div id="ayuda">Arrastra para rotar &middot; rueda/pellizco para zoom &middot; Esc para salir</div>
+<button id="btnSalir">Salir (Esc)</button>
+<div id="estadoFetch">Esperando orbita_actual.json...</div>
+<div id="contenedor3d"></div>
+
+<script src="assets/vendor/three.min.js"></script>
+<script>
+(function(){
+  const cont = document.getElementById('contenedor3d');
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.set(0, 0, 6.2);
+
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  cont.appendChild(renderer.domElement);
+
+  window.addEventListener('resize', function(){
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const luz = new THREE.DirectionalLight(0xffffff, 1.1);
+  luz.position.set(5, 3, 5);
+  scene.add(luz);
+
+  // Estrellas de fondo
+  const estrellas = new THREE.Group();
+  const geomEstrella = new THREE.SphereGeometry(0.02, 4, 4);
+  const matEstrella = new THREE.MeshBasicMaterial({color: 0xffffff});
+  for(let i=0;i<300;i++){
+    const e = new THREE.Mesh(geomEstrella, matEstrella);
+    const r = 15;
+    const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+    e.position.set(r*Math.sin(phi)*Math.cos(theta), r*Math.sin(phi)*Math.sin(theta), r*Math.cos(phi));
+    estrellas.add(e);
+  }
+  scene.add(estrellas);
+
+  const R_TIERRA = 2.0;
+  const R_TIERRA_KM = 6371.0;
+  const ESCALA = R_TIERRA / R_TIERRA_KM;
+
+  const grupo = new THREE.Group();
+  scene.add(grupo);
+
+  const tierra = new THREE.Mesh(
+    new THREE.SphereGeometry(R_TIERRA, 64, 48),
+    new THREE.MeshPhongMaterial({color: 0x223355, shininess: 8})
+  );
+  grupo.add(tierra);
+
+  new THREE.TextureLoader().load('assets/tierra.jpg', function(textura){
+    tierra.material = new THREE.MeshPhongMaterial({map: textura, shininess: 8});
+  });
+
+  function latLonAPosicion(lat, lon, radio){
+    const la = lat * Math.PI / 180;
+    const lo = lon * Math.PI / 180;
+    const x = radio * Math.cos(la) * Math.cos(lo);
+    const y = radio * Math.sin(la);
+    const z = radio * Math.cos(la) * Math.sin(lo);
+    return new THREE.Vector3(x, y, z);
+  }
+
+  // Satélite
+  const satelite = new THREE.Mesh(
+    new THREE.SphereGeometry(0.06, 16, 16),
+    new THREE.MeshBasicMaterial({color: 0xE24B4A})
+  );
+  grupo.add(satelite);
+
+  let lineaOrbita = null;
+  let estacion = null;
+  let gsLat = 22.77, gsLon = -102.58;
+
+  // Interpolación suave entre posiciones recibidas cada 1 s
+  let posAnterior = null;   // {lat, lon, alt_km}
+  let posNueva = null;      // {lat, lon, alt_km}
+  let tiempoFetch = 0;      // ms (performance.now)
+
+  function distanciaAngular(lat1, lon1, lat2, lon2){
+    const r = Math.PI / 180;
+    const d = Math.sin(lat1*r)*Math.sin(lat2*r) + Math.cos(lat1*r)*Math.cos(lat2*r)*Math.cos((lon1-lon2)*r);
+    return Math.acos(Math.max(-1, Math.min(1, d))) * 180 / Math.PI;
+  }
+
+  function construirOrbita(puntos){
+    if(lineaOrbita){
+      grupo.remove(lineaOrbita);
+      lineaOrbita.geometry.dispose();
+      lineaOrbita.material.dispose();
+    }
+    const verts = puntos.map(p => {
+      const r = R_TIERRA + p.alt_km * ESCALA;
+      return latLonAPosicion(p.lat, p.lon, r);
+    });
+    if(verts.length > 0) verts.push(verts[0].clone());
+    const geom = new THREE.BufferGeometry().setFromPoints(verts);
+    lineaOrbita = new THREE.Line(geom, new THREE.LineBasicMaterial({color: 0x5DCAA5}));
+    grupo.add(lineaOrbita);
+  }
+
+  function construirEstacion(lat, lon){
+    if(estacion){
+      grupo.remove(estacion);
+      estacion.geometry.dispose();
+      estacion.material.dispose();
+    }
+    const pos = latLonAPosicion(lat, lon, R_TIERRA + 0.02);
+    estacion = new THREE.Mesh(
+      new THREE.ConeGeometry(0.05, 0.12, 8),
+      new THREE.MeshBasicMaterial({color: 0xEF9F27})
+    );
+    estacion.position.copy(pos);
+    estacion.lookAt(pos.clone().multiplyScalar(2));
+    estacion.rotateX(Math.PI/2);
+    grupo.add(estacion);
+  }
+
+  const outNombre = document.getElementById('outNombre');
+  const outLat = document.getElementById('outLat');
+  const outLon = document.getElementById('outLon');
+  const outAlt = document.getElementById('outAlt');
+  const outVisible = document.getElementById('outVisible');
+  const estadoFetch = document.getElementById('estadoFetch');
+
+  function normalizarLon(lon){
+    return ((lon + 180) % 360 + 360) % 360 - 180;
+  }
+
+  let orbitaYaDibujada = false;
+
+  function cargarDatos(){
+    fetch('orbita_actual.json?v=' + Date.now(), {cache: 'no-store'})
+      .then(r => r.json())
+      .then(d => {
+        estadoFetch.style.display = 'none';
+        outNombre.textContent = d.satelite || 'Satélite';
+        gsLat = d.observador.lat;
+        gsLon = d.observador.lon;
+
+        // La órbita completa solo se redibuja la primera vez
+        if(!orbitaYaDibujada){
+          construirOrbita(d.orbita);
+          construirEstacion(gsLat, gsLon);
+          orbitaYaDibujada = true;
+        }
+
+        // Actualiza la posición objetivo para interpolación suave
+        if(d.posicion_actual){
+          if(posNueva === null){
+            // Primera vez: sin interpolación
+            posAnterior = d.posicion_actual;
+            posNueva = d.posicion_actual;
+          } else {
+            posAnterior = posNueva;
+            posNueva = d.posicion_actual;
+          }
+          tiempoFetch = performance.now();
+        }
+      })
+      .catch(err => {
+        estadoFetch.style.display = 'block';
+        console.warn('Esperando orbita_actual.json...', err);
+      });
+  }
+  cargarDatos();
+  setInterval(cargarDatos, 1000);
+
+  // ---- Interacción con la cámara ----
+  let rotY = 0.6, rotX = -0.3;
+  let arrastrando = false;
+  let ultimoX = 0, ultimoY = 0;
+  let distanciaPinchAnterior = null;
+
+  function inicioArrastre(x, y){ arrastrando = true; ultimoX = x; ultimoY = y; }
+  function moverArrastre(x, y){
+    if(!arrastrando) return;
+    const dx = x - ultimoX, dy = y - ultimoY;
+    rotY += dx * 0.005;
+    rotX += dy * 0.005;
+    rotX = Math.max(-1.3, Math.min(1.3, rotX));
+    ultimoX = x; ultimoY = y;
+  }
+  function finArrastre(){ arrastrando = false; distanciaPinchAnterior = null; }
+
+  const dom = renderer.domElement;
+  dom.addEventListener('mousedown', e => inicioArrastre(e.clientX, e.clientY));
+  window.addEventListener('mousemove', e => moverArrastre(e.clientX, e.clientY));
+  window.addEventListener('mouseup', finArrastre);
+
+  dom.addEventListener('touchstart', e => {
+    if(e.touches.length === 1){
+      inicioArrastre(e.touches[0].clientX, e.touches[0].clientY);
+    } else if(e.touches.length === 2){
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      distanciaPinchAnterior = Math.sqrt(dx*dx + dy*dy);
+    }
+    e.preventDefault();
+  }, {passive:false});
+
+  dom.addEventListener('touchmove', e => {
+    if(e.touches.length === 1){
+      moverArrastre(e.touches[0].clientX, e.touches[0].clientY);
+    } else if(e.touches.length === 2){
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if(distanciaPinchAnterior !== null){
+        const delta = dist - distanciaPinchAnterior;
+        camera.position.z = Math.max(3.2, Math.min(12, camera.position.z - delta * 0.02));
+      }
+      distanciaPinchAnterior = dist;
+    }
+    e.preventDefault();
+  }, {passive:false});
+
+  dom.addEventListener('touchend', finArrastre);
+
+  dom.addEventListener('wheel', e => {
+    camera.position.z = Math.max(3.2, Math.min(12, camera.position.z + e.deltaY * 0.005));
+    e.preventDefault();
+  }, {passive:false});
+
+  document.getElementById('btnSalir').addEventListener('click', () => window.close());
+  window.addEventListener('keydown', e => { if(e.key === 'Escape') window.close(); });
+
+  // ---- Loop de animación ----
+  function interpolarLon(l0, l1, frac){
+    let l1c = l1;
+    if(Math.abs(l1c - l0) > 180){
+      l1c += (l1c > l0) ? -360 : 360;
+    }
+    let lon = l0 + (l1c - l0) * frac;
+    return normalizarLon(lon);
+  }
+
+  function animar(){
+    if(posAnterior && posNueva){
+      const ahora = performance.now();
+      let frac = (ahora - tiempoFetch) / 1000.0;  // 0 → 1 en 1 segundo
+      if(frac > 1) frac = 1;
+
+      const lat = posAnterior.lat + (posNueva.lat - posAnterior.lat) * frac;
+      const lon = interpolarLon(posAnterior.lon, posNueva.lon, frac);
+      const alt = posAnterior.alt_km + (posNueva.alt_km - posAnterior.alt_km) * frac;
+
+      const r = R_TIERRA + alt * ESCALA;
+      satelite.position.copy(latLonAPosicion(lat, lon, r));
+
+      outLat.textContent = posNueva.lat.toFixed(2);
+      outLon.textContent = posNueva.lon.toFixed(2);
+      outAlt.textContent = posNueva.alt_km.toFixed(0);
+      const dist = distanciaAngular(posNueva.lat, posNueva.lon, gsLat, gsLon);
+      const visible = dist < 22;
+      outVisible.textContent = visible ? 'Si' : 'No';
+      outVisible.style.color = visible ? '#5DCAA5' : '#eee';
+    }
+
+    grupo.rotation.y = rotY;
+    grupo.rotation.x = rotX;
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(animar);
+  }
+  requestAnimationFrame(animar);
+})();
+</script>
+</body>
+</html>

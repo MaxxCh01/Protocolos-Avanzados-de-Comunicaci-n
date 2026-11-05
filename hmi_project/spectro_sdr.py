@@ -1,16 +1,14 @@
 """
 Módulo de análisis de espectro para la pantalla "Espectro SDR" del HMI.
 
-Intenta usar un receptor RTL-SDR real (vía pyrtlsdr) para capturar el
-espectro alrededor de la frecuencia LRPT (137 MHz) del satélite Meteor-M
+Usa un receptor RTL-SDR real (vía pyrtlsdr) para capturar el espectro
+alrededor de la frecuencia LRPT (137 MHz) del satélite Meteor-M
 seleccionado y detectar si su portadora está presente.
 
-Si no hay un RTL-SDR conectado (por ejemplo durante pruebas en una PC sin
-hardware, igual que el "modo simulación" que ya usa antenna_control.py),
-cae a un modo de simulación: genera una señal realista basada en si el
-satélite está realmente sobre el horizonte y en su velocidad radial (para
-reproducir el corrimiento Doppler), de modo que la pantalla del HMI se
-pueda seguir usando para desarrollo/demostración sin hardware conectado.
+IMPORTANTE: si no hay un RTL-SDR conectado, este módulo NO inventa
+ninguna señal — devuelve ruido puro y lo marca como modo "sin_hardware",
+para que la pantalla del HMI muestre honestamente "SDR no conectado" en
+vez de simular una portadora que no existe de verdad.
 """
 import numpy as np
 import config
@@ -18,7 +16,9 @@ import config
 try:
     from rtlsdr import RtlSdr
     HAY_HARDWARE_SDR = True
-except (ImportError, OSError):
+except (ImportError, OSError, AttributeError) as e:
+    print(f"[SDR] No se pudo importar pyrtlsdr/librtlsdr: {e}")
+    print("[SDR] Corre 'python3 diagnostico_sdr.py' para diagnosticar por qué.")
     RtlSdr = None
     HAY_HARDWARE_SDR = False
 
@@ -38,34 +38,17 @@ def _capturar_con_rtlsdr(frecuencia_central_hz):
     return muestras
 
 
-def _simular_muestras(frecuencia_central_hz, frecuencia_esperada_hz, hay_pase, velocidad_radial_km_s):
-    """Genera muestras IQ sintéticas para cuando no hay hardware SDR conectado.
-
-    Si `hay_pase` es False (satélite bajo el horizonte) solo devuelve ruido,
-    para que la pantalla muestre correctamente "no está pasando". Si es
-    True, añade un tono con corrimiento Doppler cerca de la frecuencia LRPT,
-    simulando la portadora recibida durante un pase real.
-    """
+def _ruido_puro():
+    """Sin hardware conectado no hay nada que capturar de verdad: se
+    devuelve solo ruido, sin ninguna portadora simulada."""
     n = config.SDR_N_MUESTRAS
-    fs = config.SDR_SAMPLE_RATE_HZ
-    ruido = (np.random.randn(n) + 1j * np.random.randn(n)) * 0.35
-
-    if not hay_pase:
-        return ruido
-
-    corrimiento_doppler_hz = -velocidad_radial_km_s / VELOCIDAD_LUZ_KM_S * frecuencia_esperada_hz
-    f_señal = (frecuencia_esperada_hz + corrimiento_doppler_hz) - frecuencia_central_hz
-
-    t = np.arange(n) / fs
-    ruido_fase = np.cumsum(np.random.randn(n)) * 0.002  # da textura de modulación QPSK/LRPT
-    señal = 1.6 * np.exp(1j * (2 * np.pi * f_señal * t + ruido_fase))
-    return señal + ruido
+    return (np.random.randn(n) + 1j * np.random.randn(n)) * 0.35
 
 
 def analizar(frecuencia_central_hz, frecuencia_esperada_hz, hay_pase=True, velocidad_radial_km_s=0.0):
     """
-    Captura (o simula) el espectro alrededor de `frecuencia_central_hz` y
-    busca la portadora del satélite cerca de `frecuencia_esperada_hz`.
+    Captura el espectro alrededor de `frecuencia_central_hz` y busca la
+    portadora del satélite cerca de `frecuencia_esperada_hz`.
 
     Devuelve un diccionario con:
       - frecuencias_hz: eje de frecuencias relativo a la frecuencia central (Hz)
@@ -74,21 +57,20 @@ def analizar(frecuencia_central_hz, frecuencia_esperada_hz, hay_pase=True, veloc
       - detectado: True si se encontró una señal por encima del umbral de SNR
       - frecuencia_pico_hz: frecuencia absoluta del pico encontrado (o None)
       - snr_db: relación señal/ruido del pico encontrado
-      - modo: "hardware" (RTL-SDR real) o "simulacion"
+      - modo: "hardware" (RTL-SDR real y funcionando) o
+              "sin_hardware" (no hay ningún RTL-SDR conectado; ruido puro)
     """
     if HAY_HARDWARE_SDR:
         try:
             muestras = _capturar_con_rtlsdr(frecuencia_central_hz)
             modo = "hardware"
         except Exception as e:
-            print(f"[SDR] No se pudo usar el RTL-SDR ({e}); usando modo simulación.")
-            muestras = _simular_muestras(frecuencia_central_hz, frecuencia_esperada_hz,
-                                          hay_pase, velocidad_radial_km_s)
-            modo = "simulacion"
+            print(f"[SDR] No se pudo usar el RTL-SDR ({e}).")
+            muestras = _ruido_puro()
+            modo = "sin_hardware"
     else:
-        muestras = _simular_muestras(frecuencia_central_hz, frecuencia_esperada_hz,
-                                      hay_pase, velocidad_radial_km_s)
-        modo = "simulacion"
+        muestras = _ruido_puro()
+        modo = "sin_hardware"
 
     # Periodograma promediado (método de Welch): se parte el bloque IQ en
     # varios segmentos, se calcula la FFT de cada uno y se promedia su
@@ -118,7 +100,9 @@ def analizar(frecuencia_central_hz, frecuencia_esperada_hz, hay_pase=True, veloc
     frecuencia_pico_relativa = float(frecuencias_hz[mascara][indice_local])
 
     snr_db = potencia_pico_db - piso_ruido_db
-    detectado = snr_db >= config.SDR_UMBRAL_SNR_DB
+    # Sin hardware real nunca se declara "detectado", sin importar qué tan
+    # ruidoso salga el piso: no hay portadora real que detectar.
+    detectado = (modo == "hardware") and (snr_db >= config.SDR_UMBRAL_SNR_DB)
 
     return {
         "frecuencias_hz": frecuencias_hz,
